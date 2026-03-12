@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+# Edit these on your local machine after copying the script off the instance.
+SSH_TARGET="${SSH_TARGET:-CHANGE_ME}"
+REMOTE_DIR="${REMOTE_DIR:-/home/ec2-user/clipboard-uploads}"
+RECEIVER_PATH="${RECEIVER_PATH:-/home/ec2-user/bin/receive-clipboard-image}"
+
+if [[ "${1:-}" != "" ]]; then
+  SSH_TARGET="$1"
+fi
+
+if [[ "$SSH_TARGET" == "CHANGE_ME" || -z "$SSH_TARGET" ]]; then
+  echo "Set SSH_TARGET in the script or pass it as the first argument" >&2
+  exit 1
+fi
+
+if ! command -v xclip >/dev/null 2>&1; then
+  echo "xclip is required. Install it with your package manager." >&2
+  exit 1
+fi
+
+tmp_file="$(mktemp /tmp/remote-paste-image-XXXXXX.png)"
+cleanup() {
+  rm -f "$tmp_file"
+}
+trap cleanup EXIT
+
+if ! xclip -selection clipboard -t image/png -o >"$tmp_file" 2>/dev/null; then
+  echo "Clipboard does not contain a PNG image" >&2
+  exit 2
+fi
+
+if [[ ! -s "$tmp_file" ]]; then
+  echo "Clipboard does not contain an image" >&2
+  exit 2
+fi
+
+remote_cmd="$(printf '%q ' "$RECEIVER_PATH" "--dir" "$REMOTE_DIR" "--ext" "png")"
+ssh "$SSH_TARGET" "$remote_cmd" <"$tmp_file"
