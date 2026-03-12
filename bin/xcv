@@ -95,12 +95,12 @@ quote_remote_word() {
   local value="$1"
 
   if [[ "${value}" == "~" ]]; then
-    printf '~'
+    printf '$HOME'
     return
   fi
 
   if [[ "${value}" == "~/"* ]]; then
-    printf '~/%q' "${value#~/}"
+    printf '$HOME/%q' "${value:2}"
     return
   fi
 
@@ -774,7 +774,7 @@ Codex:
 EOF
 }
 
-session-hook_command() {
+session_hook_command() {
   load_config
   require_local_token
 
