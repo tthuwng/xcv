@@ -74,5 +74,6 @@ What it does:
 
 Next:
   ssh your-host
-  codex still uses: ${local_xcv} codex-paste your-host --copy
+  codex hotkey flow: ${local_xcv} watch start
+  one-shot codex flow: ${local_xcv} paste --copy
 EOF

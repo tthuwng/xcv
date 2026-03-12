@@ -9,7 +9,7 @@ local terminal_apps = {
 
 local upload_in_progress = false
 
-hs.hotkey.bind({ "ctrl" }, "v", function()
+hs.hotkey.bind({ "cmd" }, "v", function()
   local app = hs.application.frontmostApplication()
   if not app or not terminal_apps[app:name()] then
     hs.eventtap.keyStroke({ "cmd" }, "v", 0)
@@ -24,10 +24,11 @@ hs.hotkey.bind({ "ctrl" }, "v", function()
 
   local task = hs.task.new("/bin/bash", function(exit_code, stdout, stderr)
     upload_in_progress = false
+    local out = stdout:gsub("%s+$", "")
     local err = stderr:gsub("%s+$", "")
 
-    if exit_code == 0 then
-      hs.eventtap.keyStroke({ "cmd" }, "v", 0)
+    if exit_code == 0 and out ~= "" then
+      hs.eventtap.keyStrokes(out)
       return
     end
 
@@ -37,7 +38,7 @@ hs.hotkey.bind({ "ctrl" }, "v", function()
     end
 
     hs.alert.show(err ~= "" and err or "Remote image paste failed")
-  end, nil, { "-lc", string.format("command -v %q >/dev/null 2>&1 && %q paste --copy || \"$HOME/.local/bin/xcv\" paste --copy || \"$HOME/bin/xcv\" paste --copy", xcv, xcv) })
+  end, nil, { "-lc", string.format("command -v %q >/dev/null 2>&1 && %q paste || \"$HOME/.local/bin/xcv\" paste || \"$HOME/bin/xcv\" paste", xcv, xcv) })
 
   if not task:start() then
     upload_in_progress = false

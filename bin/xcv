@@ -8,6 +8,7 @@ config_dir="${XDG_CONFIG_HOME:-${HOME}/.config}/xcv"
 config_file="${config_dir}/config"
 known_hosts_file="${config_dir}/known_hosts"
 latest_image_file="${config_dir}/latest-clipboard.png"
+staged_hash_file="${config_dir}/staged-image.sha256"
 pid_file="${config_dir}/daemon.pid"
 log_file="${config_dir}/daemon.log"
 watch_pid_file="${config_dir}/watch.pid"
@@ -19,7 +20,7 @@ usage() {
 Usage:
   xcv setup HOST
   xcv daemon start|stop|status|run
-  xcv watch start|stop|status|run [HOST] [--interval SECONDS]
+  xcv watch start|stop|status|run [HOST] [--interval SECONDS] [--copy]
   xcv ssh [HOST] [SSH_ARGS...]
   xcv paste [HOST] [--copy] [--format path|file-url]
   xcv codex-paste [HOST] [--copy] [--format path|file-url]
@@ -31,7 +32,7 @@ Usage:
 Commands:
   setup        Configure SSH integration, start the daemon, and bootstrap a host
   daemon       Manage the local clipboard daemon used by both Codex and Claude
-  watch        Automatically upload copied images for Codex and replace clipboard with the remote path
+  watch        Automatically upload copied images for Codex without changing the local clipboard
   ssh          Open SSH with the required remote forward for Claude image paste
   paste        Alias for codex-paste
   codex-paste  Fetch the clipboard image onto the remote host and print its path
@@ -467,6 +468,39 @@ save_latest_clipboard_image() {
   chmod 0600 "${latest_image_file}"
 }
 
+load_staged_image_hash() {
+  if [[ -f "${staged_hash_file}" ]]; then
+    head -n 1 "${staged_hash_file}"
+  fi
+}
+
+save_staged_image_hash() {
+  local image_hash="$1"
+
+  mkdir -p "${config_dir}"
+  printf '%s\n' "${image_hash}" >"${staged_hash_file}"
+  chmod 0600 "${staged_hash_file}"
+}
+
+format_shared_remote_clipboard_path() {
+  local output_format="${1:-path}"
+  local remote_path=""
+  remote_path="$(shared_remote_clipboard_path)"
+
+  case "${output_format}" in
+    path)
+      printf '%s\n' "${remote_path}"
+      ;;
+    file-url)
+      printf 'file://%s\n' "${remote_path}"
+      ;;
+    *)
+      echo "Unsupported format: ${output_format}" >&2
+      return 1
+      ;;
+  esac
+}
+
 sync_latest_image_to_host() {
   local ssh_target="$1"
 
@@ -678,9 +712,12 @@ codex_paste_command() {
   shared_path="$(shared_remote_clipboard_path)"
   local snapshot_file=""
   snapshot_file="$(mktemp "${TMPDIR:-/tmp}/xcv-paste.XXXXXX.png")"
+  local image_hash=""
+  local staged_hash=""
 
   if fetch_local_clipboard_png "${snapshot_file}"; then
     save_latest_clipboard_image "${snapshot_file}"
+    image_hash="$(sha256_file "${snapshot_file}")"
   else
     local snapshot_status=$?
     rm -f "${snapshot_file}"
@@ -695,9 +732,20 @@ codex_paste_command() {
   fi
 
   local result
-  if ! result="$(broadcast_remote_clipboard_path "${ssh_target}" "${output_format}" "codex-clipboard" "${shared_path}")"; then
-    rm -f "${snapshot_file}"
-    exit $?
+  staged_hash="$(trim "$(load_staged_image_hash || true)")"
+  if [[ -z "${ssh_target}" && -n "${image_hash}" && -n "${staged_hash}" && "${image_hash}" == "${staged_hash}" ]]; then
+    if ! result="$(format_shared_remote_clipboard_path "${output_format}")"; then
+      rm -f "${snapshot_file}"
+      exit 1
+    fi
+  else
+    if ! result="$(broadcast_remote_clipboard_path "${ssh_target}" "${output_format}" "codex-clipboard" "${shared_path}")"; then
+      rm -f "${snapshot_file}"
+      exit $?
+    fi
+    if [[ -n "${image_hash}" ]]; then
+      save_staged_image_hash "${image_hash}"
+    fi
   fi
   rm -f "${snapshot_file}"
 
@@ -721,6 +769,7 @@ watch_start_command() {
 
   local watch_host=""
   local interval="0.75"
+  local should_copy="0"
 
   if (($# > 0)) && [[ "${1}" != --* ]]; then
     watch_host="$1"
@@ -732,6 +781,10 @@ watch_start_command() {
       --interval)
         interval="${2:?missing value for --interval}"
         shift 2
+        ;;
+      --copy)
+        should_copy="1"
+        shift
         ;;
       -h|--help)
         usage
@@ -764,6 +817,9 @@ watch_start_command() {
     watch_cmd+=("${watch_host}")
   fi
   watch_cmd+=("--interval" "${interval}")
+  if [[ "${should_copy}" == "1" ]]; then
+    watch_cmd+=("--copy")
+  fi
 
   nohup "${watch_cmd[@]}" >>"${watch_log_file}" 2>&1 &
 
@@ -828,6 +884,7 @@ watch_run_command() {
 
   local watch_host=""
   local interval="0.75"
+  local should_copy="0"
 
   if (($# > 0)) && [[ "${1}" != --* ]]; then
     watch_host="$1"
@@ -839,6 +896,10 @@ watch_run_command() {
       --interval)
         interval="${2:?missing value for --interval}"
         shift 2
+        ;;
+      --copy)
+        should_copy="1"
+        shift
         ;;
       -h|--help)
         usage
@@ -875,8 +936,13 @@ watch_run_command() {
         if remote_path="$(broadcast_remote_clipboard_path "${watch_host}" "path" "codex-clipboard" "${shared_path}")"; then
           remote_path="$(trim "${remote_path}")"
           if [[ -n "${remote_path}" ]]; then
-            copy_text_to_local_clipboard "${remote_path}"
-            printf '[%s] uploaded clipboard image to %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "${remote_path}"
+            save_staged_image_hash "${image_hash}"
+            if [[ "${should_copy}" == "1" ]]; then
+              copy_text_to_local_clipboard "${remote_path}"
+              printf '[%s] staged clipboard image at %s and copied the remote path to the local clipboard\n' "$(date '+%Y-%m-%d %H:%M:%S')" "${remote_path}"
+            else
+              printf '[%s] staged clipboard image at %s without changing the local clipboard\n' "$(date '+%Y-%m-%d %H:%M:%S')" "${remote_path}"
+            fi
           fi
         else
           if [[ -n "${watch_host}" ]]; then
@@ -1310,7 +1376,8 @@ Claude Code:
   Ctrl+V now uses your local clipboard over SSH.
 
 Codex:
-  Auto mode across active xcv SSH sessions: xcv watch start
+  Stage copied images without touching your clipboard: xcv watch start
+  Use the Hammerspoon/AutoKey example from the README to type the remote path into your terminal.
   xcv paste --copy
   Then use your terminal's normal paste shortcut.
 EOF

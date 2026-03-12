@@ -39,7 +39,7 @@ Automatic:
 xcv watch start
 ```
 
-After that, whenever your local clipboard changes to an image, `xcv` uploads it to every active `xcv` SSH session and replaces your local clipboard with one shared remote path text under `/tmp`. Your next normal paste in Codex inserts that path, regardless of which active SSH host you are in.
+After that, whenever your local clipboard changes to an image, `xcv` uploads it to every active `xcv` SSH session at one shared remote path under `/tmp` without changing your local clipboard. Pair this with a local hotkey that runs `xcv paste` and types the returned path into the terminal. That keeps macOS clipboard history clean and still makes remote image paste fast.
 
 ## What `xcv setup` does
 
@@ -64,7 +64,7 @@ xcv doctor
 ```
 
 `xcv paste` is an alias for `xcv codex-paste`.
-`xcv watch start` is the opt-in Codex auto-upload mode across all active `xcv` SSH sessions.
+`xcv watch start` is the opt-in Codex background staging mode across all active `xcv` SSH sessions.
 
 ## Hotkeys
 
@@ -73,7 +73,9 @@ The hotkey still runs locally because the clipboard lives on your laptop.
 - macOS Hammerspoon example: `local/macos/hammerspoon-paste-image.lua.example`
 - Linux X11 AutoKey example: `local/linux-x11/autokey-paste-image.py.example`
 
-Both examples assume you already ran `xcv setup HOST`, so `xcv paste --copy` or `xcv watch start` can use active `xcv` SSH sessions and fall back to the saved default host.
+Both examples assume you already ran `xcv setup HOST`, so `xcv paste` or `xcv watch start` can use active `xcv` SSH sessions and fall back to the saved default host.
+
+The macOS and Linux examples avoid rewriting your local clipboard. They run `xcv paste`, then type the remote path into the active terminal window.
 
 ## Requirements
 
@@ -94,5 +96,6 @@ Remote host:
 - `xcv setup HOST` is the main entrypoint.
 - `xcv ssh HOST` still exists if you want an explicit wrapper instead of automatic SSH integration.
 - `xcv watch start` is global to your local clipboard.
-- In automatic Codex mode, `xcv` syncs the latest image to all active `xcv` SSH sessions at one shared `/tmp/xcv-.../current.png` path.
+- `xcv watch start --copy` preserves the older behavior where the remote path is copied into your local clipboard.
+- In automatic Codex mode, `xcv` syncs the latest image to all active `xcv` SSH sessions at one shared `/tmp/xcv-.../current.png` path and leaves your local clipboard unchanged by default.
 - If there are no active `xcv` SSH sessions, Codex falls back to the saved default host from `xcv setup HOST`.

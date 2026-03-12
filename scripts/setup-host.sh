@@ -96,5 +96,6 @@ Configured:
 Next:
   ${HOME}/bin/xcv daemon start
   ${HOME}/bin/xcv ssh ${ssh_target}      # Claude Code
-  ${HOME}/bin/xcv codex-paste ${ssh_target} --copy
+  ${HOME}/bin/xcv watch start            # Codex hotkey flow
+  ${HOME}/bin/xcv paste --copy           # Codex one-shot flow
 EOF
