@@ -19,6 +19,8 @@ curl -fsSL https://raw.githubusercontent.com/tthuwng/xcv/main/scripts/install.sh
 xcv setup myserver
 ```
 
+If `xcv` is not on your `PATH` yet, use the full path printed by the installer.
+
 Done. `Ctrl+V` in remote Claude Code now pastes images from your local machine.
 
 For Codex, run:

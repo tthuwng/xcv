@@ -1,4 +1,4 @@
-local xcv = os.getenv("HOME") .. "/bin/xcv"
+local xcv = "xcv"
 local terminal_apps = {
   ["iTerm2"] = true,
   ["Terminal"] = true,
@@ -37,7 +37,7 @@ hs.hotkey.bind({ "ctrl" }, "v", function()
     end
 
     hs.alert.show(err ~= "" and err or "Remote image paste failed")
-  end, nil, { "-lc", string.format("%q paste --copy", xcv) })
+  end, nil, { "-lc", string.format("command -v %q >/dev/null 2>&1 && %q paste --copy || \"$HOME/.local/bin/xcv\" paste --copy || \"$HOME/bin/xcv\" paste --copy", xcv, xcv) })
 
   if not task:start() then
     upload_in_progress = false

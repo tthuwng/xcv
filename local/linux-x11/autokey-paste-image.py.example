@@ -1,7 +1,22 @@
+import os
+import shutil
 import subprocess
 
-xcv = "/home/your-user/bin/xcv"
-paste_shortcut = "<ctrl>+shift+v>"
+xcv = shutil.which("xcv")
+if not xcv:
+    for candidate in (
+        os.path.join(os.environ["HOME"], ".local", "bin", "xcv"),
+        os.path.join(os.environ["HOME"], "bin", "xcv"),
+    ):
+        if os.path.isfile(candidate):
+            xcv = candidate
+            break
+
+if not xcv:
+    dialog.info_dialog(title="Remote image paste failed", message="Could not find xcv. Install it first.")
+    raise SystemExit
+
+paste_shortcut = "<ctrl>+<shift>+v"
 
 result = subprocess.run([xcv, "paste", "--copy"], capture_output=True, text=True)
 

@@ -1,5 +1,5 @@
 .DS_Store
 *.swp
 *.swo
-bin/__pycache__/
+__pycache__/
 clipboard-uploads/
