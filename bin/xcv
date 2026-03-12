@@ -825,7 +825,12 @@ watch_start_command() {
 
   for _ in 1 2 3 4 5; do
     if watch_running; then
-      echo "xcv watch started (pid $(cat "${watch_pid_file}"))."
+      cat <<EOF
+xcv watch started (pid $(cat "${watch_pid_file}")).
+Codex note:
+  watch mode only stages images to active xcv SSH sessions.
+  To paste into Codex, use the Hammerspoon/AutoKey example or run xcv paste HOST --copy.
+EOF
       return 0
     fi
     sleep 0.2
