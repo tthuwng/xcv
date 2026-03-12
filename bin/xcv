@@ -18,7 +18,7 @@ xcvd_path="${script_dir}/xcvd"
 usage() {
   cat <<'EOF'
 Usage:
-  xcv setup HOST
+  xcv setup [HOST]
   xcv daemon start|stop|status|run
   xcv watch start|stop|status|run [HOST] [--interval SECONDS] [--copy]
   xcv ssh [HOST] [SSH_ARGS...]
@@ -182,7 +182,7 @@ watch_running() {
 
 require_local_token() {
   if [[ -z "${XCV_TOKEN}" ]]; then
-    echo "XCV_TOKEN is not set. Run xcv setup HOST first." >&2
+    echo "XCV_TOKEN is not set. Run xcv setup first." >&2
     exit 1
   fi
 }
@@ -190,7 +190,7 @@ require_local_token() {
 require_ssh_target() {
   local target="${1:-${SSH_TARGET}}"
   if [[ -z "${target}" ]]; then
-    echo "SSH target is not set. Run xcv setup HOST or pass a host." >&2
+    echo "SSH target is not set. Pass a host, open an active xcv SSH session, or run xcv setup HOST to save a fallback host." >&2
     exit 1
   fi
   printf '%s\n' "${target}"
@@ -405,7 +405,9 @@ resolve_codex_target_hosts() {
     return 0
   fi
 
-  require_ssh_target
+  if [[ -n "${SSH_TARGET}" ]]; then
+    printf '%s\n' "${SSH_TARGET}"
+  fi
 }
 
 broadcast_remote_clipboard_path() {
@@ -427,7 +429,7 @@ broadcast_remote_clipboard_path() {
   done < <(resolve_codex_target_hosts "${preferred_host}")
 
   if ((${#hosts[@]} == 0)); then
-    echo "No SSH target is available for Codex paste." >&2
+    echo "No SSH target is available for Codex paste. Open an xcv-managed SSH session first, pass HOST, or run xcv setup HOST to save a fallback host." >&2
     return 1
   fi
 
@@ -799,10 +801,6 @@ watch_start_command() {
 
   if [[ -n "${watch_host}" ]]; then
     require_ssh_target "${watch_host}" >/dev/null
-  else
-    if [[ -z "$(list_active_hosts || true)" ]]; then
-      require_ssh_target >/dev/null
-    fi
   fi
 
   if watch_running; then
@@ -1345,10 +1343,13 @@ setup_command() {
 
   if [[ -n "${ssh_target}" ]]; then
     SSH_TARGET="${ssh_target}"
+  else
+    SSH_TARGET=""
   fi
 
-  SSH_TARGET="$(require_ssh_target)"
-  remember_known_host "${SSH_TARGET}"
+  if [[ -n "${SSH_TARGET}" ]]; then
+    remember_known_host "${SSH_TARGET}"
+  fi
 
   if [[ -z "${XCV_TOKEN}" ]]; then
     XCV_TOKEN="$(random_token)"
@@ -1363,12 +1364,15 @@ setup_command() {
 
   warn_if_local_image_clipboard_backend_missing
 
-  if ! bootstrap_remote_host "${SSH_TARGET}" "0"; then
-    echo "Failed to bootstrap ${SSH_TARGET}." >&2
-    exit 1
+  if [[ -n "${SSH_TARGET}" ]]; then
+    if ! bootstrap_remote_host "${SSH_TARGET}" "0"; then
+      echo "Failed to bootstrap ${SSH_TARGET}." >&2
+      exit 1
+    fi
   fi
 
-  cat <<EOF
+  if [[ -n "${SSH_TARGET}" ]]; then
+    cat <<EOF
 Done.
 
 Claude Code:
@@ -1381,6 +1385,24 @@ Codex:
   xcv paste --copy
   Then use your terminal's normal paste shortcut.
 EOF
+  else
+    cat <<'EOF'
+Done.
+
+Local integration:
+  Interactive SSH sessions now auto-enable xcv.
+  The first interactive connection to each host bootstraps the remote helper automatically.
+
+Claude Code:
+  ssh any-host
+  Ctrl+V now uses your local clipboard over SSH.
+
+Codex:
+  xcv watch start
+  Use the Hammerspoon/AutoKey example from the README to type the remote path into your terminal.
+  xcv paste HOST --copy
+EOF
+  fi
 }
 
 session_hook_command() {

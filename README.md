@@ -15,9 +15,11 @@ No X11 forwarding. No terminal-specific transport. Works over plain SSH.
 # Install
 curl -fsSL https://raw.githubusercontent.com/tthuwng/xcv/main/scripts/install.sh | sh
 
-# Setup (one command does everything)
-xcv setup myserver
+# Setup once on your local machine
+xcv setup
 ```
+
+Optional: `xcv setup myserver` if you want one saved fallback host for one-shot Codex uploads when no SSH session is active yet.
 
 If `xcv` is not on your `PATH` yet, use the full path printed by the installer.
 
@@ -46,18 +48,18 @@ After that, whenever your local clipboard changes to an image, `xcv` uploads it 
 - writes `~/.config/xcv/config`
 - installs `~/.ssh/xcv.conf` and adds an `Include` line to `~/.ssh/config`
 - starts the local clipboard daemon
-- bootstraps the remote `xcv` helper and `xclip` shim on the target host
-- stores the host you passed as the default fallback target
+- prepares every future interactive SSH session to bootstrap the remote `xcv` helper and `xclip` shim on first connect
+- optionally stores a host you passed as the default fallback target
 - remembers `xcv` SSH hosts and uses active sessions first for Codex auto-upload
 
-After setup, plain interactive `ssh myserver` sessions automatically get the remote forward and on-demand remote bootstrap.
+After setup, plain interactive `ssh your-host` sessions automatically get the remote forward and on-demand remote bootstrap.
 
 If a host disallows remote forwarding, SSH still works normally; only clipboard forwarding is unavailable on that host.
 
 ## Commands
 
 ```bash
-xcv setup HOST
+xcv setup [HOST]
 xcv paste --copy
 xcv watch start
 xcv doctor
@@ -73,7 +75,7 @@ The hotkey still runs locally because the clipboard lives on your laptop.
 - macOS Hammerspoon example: `local/macos/hammerspoon-paste-image.lua.example`
 - Linux X11 AutoKey example: `local/linux-x11/autokey-paste-image.py.example`
 
-Both examples assume you already ran `xcv setup HOST`, so `xcv paste` or `xcv watch start` can use active `xcv` SSH sessions and fall back to the saved default host.
+Both examples assume you already ran `xcv setup`, so `xcv paste` or `xcv watch start` can use active `xcv` SSH sessions. If you also ran `xcv setup HOST`, they can fall back to that saved host when there is no active session yet.
 
 The macOS and Linux examples avoid rewriting your local clipboard. They run `xcv paste`, then type the remote path into the active terminal window.
 
@@ -93,9 +95,9 @@ Remote host:
 
 ## Notes
 
-- `xcv setup HOST` is the main entrypoint.
+- `xcv setup` is the main entrypoint.
 - `xcv ssh HOST` still exists if you want an explicit wrapper instead of automatic SSH integration.
 - `xcv watch start` is global to your local clipboard.
 - `xcv watch start --copy` preserves the older behavior where the remote path is copied into your local clipboard.
 - In automatic Codex mode, `xcv` syncs the latest image to all active `xcv` SSH sessions at one shared `/tmp/xcv-.../current.png` path and leaves your local clipboard unchanged by default.
-- If there are no active `xcv` SSH sessions, Codex falls back to the saved default host from `xcv setup HOST`.
+- If there are no active `xcv` SSH sessions, Codex can fall back to the saved default host from `xcv setup HOST`.

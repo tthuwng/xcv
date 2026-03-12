@@ -72,7 +72,7 @@ main() {
     echo "xcv installed to ${install_dir}"
     echo ""
     echo "Quick start:"
-    echo "  ${xcv_cmd} setup myserver"
+    echo "  ${xcv_cmd} setup"
     echo ""
 
     if [ "$(uname -s)" = "Darwin" ] && ! command -v pngpaste >/dev/null 2>&1; then

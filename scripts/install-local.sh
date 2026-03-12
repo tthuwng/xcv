@@ -96,7 +96,7 @@ Wrote config:
 
 Next:
   ${user_bin}/xcv doctor
-  ${user_bin}/xcv setup myserver
+  ${user_bin}/xcv setup
 EOF
 
 if [[ -n "${SSH_TARGET}" ]]; then
