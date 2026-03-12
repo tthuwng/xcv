@@ -1,0 +1,46 @@
+local xcv = os.getenv("HOME") .. "/bin/xcv"
+local terminal_apps = {
+  ["iTerm2"] = true,
+  ["Terminal"] = true,
+  ["WezTerm"] = true,
+  ["Ghostty"] = true,
+  ["Alacritty"] = true,
+}
+
+local upload_in_progress = false
+
+hs.hotkey.bind({ "ctrl" }, "v", function()
+  local app = hs.application.frontmostApplication()
+  if not app or not terminal_apps[app:name()] then
+    hs.eventtap.keyStroke({ "cmd" }, "v", 0)
+    return
+  end
+
+  if upload_in_progress then
+    return
+  end
+
+  upload_in_progress = true
+
+  local task = hs.task.new("/bin/bash", function(exit_code, stdout, stderr)
+    upload_in_progress = false
+    local err = stderr:gsub("%s+$", "")
+
+    if exit_code == 0 then
+      hs.eventtap.keyStroke({ "cmd" }, "v", 0)
+      return
+    end
+
+    if exit_code == 2 then
+      hs.eventtap.keyStroke({ "cmd" }, "v", 0)
+      return
+    end
+
+    hs.alert.show(err ~= "" and err or "Remote image paste failed")
+  end, nil, { "-lc", string.format("%q paste --copy", xcv) })
+
+  if not task:start() then
+    upload_in_progress = false
+    hs.alert.show("Failed to start uploader")
+  end
+end)

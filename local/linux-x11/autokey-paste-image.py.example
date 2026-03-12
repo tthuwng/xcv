@@ -1,0 +1,12 @@
+import subprocess
+
+xcv = "/home/your-user/bin/xcv"
+paste_shortcut = "<ctrl>+shift+v>"
+
+result = subprocess.run([xcv, "paste", "--copy"], capture_output=True, text=True)
+
+if result.returncode in (0, 2):
+    keyboard.send_keys(paste_shortcut)
+else:
+    message = result.stderr.strip() or "Remote image paste failed"
+    dialog.info_dialog(title="Remote image paste failed", message=message)

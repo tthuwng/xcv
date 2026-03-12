@@ -1,0 +1,983 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+program_name="$(basename "${0}")"
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+config_dir="${XDG_CONFIG_HOME:-${HOME}/.config}/xcv"
+config_file="${config_dir}/config"
+pid_file="${config_dir}/daemon.pid"
+log_file="${config_dir}/daemon.log"
+xcvd_path="${script_dir}/xcvd"
+
+usage() {
+  cat <<'EOF'
+Usage:
+  xcv setup HOST
+  xcv daemon start|stop|status|run
+  xcv ssh [HOST] [SSH_ARGS...]
+  xcv paste [HOST] [--copy] [--format path|file-url]
+  xcv codex-paste [HOST] [--copy] [--format path|file-url]
+  xcv remote-fetch [--dest-dir PATH] [--name-prefix PREFIX] [--format path|file-url]
+  xcv session-hook HOST
+  xcv doctor
+  xcv config-path
+
+Commands:
+  setup        Configure SSH integration, start the daemon, and bootstrap a host
+  daemon       Manage the local clipboard daemon used by both Codex and Claude
+  ssh          Open SSH with the required remote forward for Claude image paste
+  paste        Alias for codex-paste
+  codex-paste  Fetch the clipboard image onto the remote host and print its path
+  remote-fetch Internal remote helper used by codex-paste
+  session-hook Internal SSH LocalCommand hook used for auto-setup
+  doctor       Show config and daemon status
+  config-path  Print the config file path
+EOF
+}
+
+default_config() {
+  SSH_TARGET=""
+  XCV_PORT="18339"
+  XCV_TOKEN=""
+  REMOTE_CACHE_DIR="~/.cache/xcv"
+  REMOTE_XCV_PATH="~/.local/bin/xcv"
+  XCV_REAL_XCLIP=""
+}
+
+load_config() {
+  default_config
+  if [[ -f "${config_file}" ]]; then
+    # shellcheck disable=SC1090
+    . "${config_file}"
+  fi
+}
+
+save_config() {
+  mkdir -p "${config_dir}"
+  cat >"${config_file}" <<EOF
+SSH_TARGET=$(printf '%q' "${SSH_TARGET}")
+XCV_PORT=$(printf '%q' "${XCV_PORT}")
+XCV_TOKEN=$(printf '%q' "${XCV_TOKEN}")
+REMOTE_CACHE_DIR=$(printf '%q' "${REMOTE_CACHE_DIR}")
+REMOTE_XCV_PATH=$(printf '%q' "${REMOTE_XCV_PATH}")
+XCV_REAL_XCLIP=$(printf '%q' "${XCV_REAL_XCLIP}")
+EOF
+  chmod 0600 "${config_file}"
+}
+
+trim() {
+  local value="$1"
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  printf '%s\n' "${value}"
+}
+
+random_token() {
+  if command -v openssl >/dev/null 2>&1; then
+    openssl rand -hex 24
+    return
+  fi
+
+  od -An -N 24 -tx1 /dev/urandom | tr -d ' \n'
+}
+
+daemon_url() {
+  printf 'http://127.0.0.1:%s\n' "${XCV_PORT}"
+}
+
+ssh_control_path() {
+  mkdir -p "${config_dir}/control"
+  printf '%s\n' "${config_dir}/control/%C"
+}
+
+quote_remote_word() {
+  local value="$1"
+
+  if [[ "${value}" == "~" ]]; then
+    printf '~'
+    return
+  fi
+
+  if [[ "${value}" == "~/"* ]]; then
+    printf '~/%q' "${value#~/}"
+    return
+  fi
+
+  printf '%q' "${value}"
+}
+
+daemon_health() {
+  curl -fsS "$(daemon_url)/health"
+}
+
+ensure_daemon_started() {
+  local quiet="${1:-0}"
+
+  load_config
+  require_local_token
+  mkdir -p "${config_dir}"
+
+  if daemon_health >/dev/null 2>&1; then
+    return 0
+  fi
+
+  if daemon_running; then
+    if [[ "${quiet}" != "1" ]]; then
+      echo "xcvd is running but not healthy. See ${log_file}." >&2
+    fi
+    return 1
+  fi
+
+  nohup "${xcvd_path}" \
+    --host 127.0.0.1 \
+    --port "${XCV_PORT}" \
+    --token "${XCV_TOKEN}" \
+    >>"${log_file}" 2>&1 &
+
+  echo "$!" >"${pid_file}"
+
+  for _ in 1 2 3 4 5; do
+    if daemon_health >/dev/null 2>&1; then
+      if [[ "${quiet}" != "1" ]]; then
+        echo "xcvd started on $(daemon_url) (pid $(cat "${pid_file}"))."
+      fi
+      return 0
+    fi
+    sleep 0.2
+  done
+
+  if [[ "${quiet}" != "1" ]]; then
+    echo "Failed to start xcvd. See ${log_file}." >&2
+  fi
+  return 1
+}
+
+daemon_running() {
+  if [[ ! -f "${pid_file}" ]]; then
+    return 1
+  fi
+
+  local pid
+  pid="$(cat "${pid_file}")"
+  [[ -n "${pid}" ]] && kill -0 "${pid}" 2>/dev/null
+}
+
+require_local_token() {
+  if [[ -z "${XCV_TOKEN}" ]]; then
+    echo "XCV_TOKEN is not set. Run xcv setup HOST first." >&2
+    exit 1
+  fi
+}
+
+require_ssh_target() {
+  local target="${1:-${SSH_TARGET}}"
+  if [[ -z "${target}" ]]; then
+    echo "SSH target is not set. Run xcv setup HOST or pass a host." >&2
+    exit 1
+  fi
+  printf '%s\n' "${target}"
+}
+
+copy_text_to_local_clipboard() {
+  local text="$1"
+
+  case "$(uname -s)" in
+    Darwin)
+      if ! command -v pbcopy >/dev/null 2>&1; then
+        echo "pbcopy is required for --copy on macOS." >&2
+        exit 1
+      fi
+      printf '%s' "${text}" | pbcopy
+      ;;
+    Linux)
+      if [[ -n "${WAYLAND_DISPLAY:-}" || "${XDG_SESSION_TYPE:-}" == "wayland" ]]; then
+        if command -v wl-copy >/dev/null 2>&1; then
+          printf '%s' "${text}" | wl-copy
+          return
+        fi
+      fi
+
+      if command -v xclip >/dev/null 2>&1; then
+        printf '%s' "${text}" | xclip -selection clipboard
+        return
+      fi
+
+      echo "No text clipboard tool found. Install wl-clipboard or xclip." >&2
+      exit 1
+      ;;
+    *)
+      echo "Unsupported platform for --copy." >&2
+      exit 1
+      ;;
+  esac
+}
+
+daemon_start_command() {
+  load_config
+
+  if daemon_health >/dev/null 2>&1; then
+    echo "xcvd is already running (pid $(cat "${pid_file}" 2>/dev/null || echo '?'))."
+    exit 0
+  fi
+
+  if ! ensure_daemon_started; then
+    exit 1
+  fi
+}
+
+daemon_stop_command() {
+  if ! daemon_running; then
+    rm -f "${pid_file}"
+    echo "xcvd is not running."
+    exit 0
+  fi
+
+  local pid
+  pid="$(cat "${pid_file}")"
+  kill "${pid}" 2>/dev/null || true
+
+  for _ in 1 2 3 4 5; do
+    if ! kill -0 "${pid}" 2>/dev/null; then
+      break
+    fi
+    sleep 0.2
+  done
+
+  rm -f "${pid_file}"
+  echo "xcvd stopped."
+}
+
+daemon_status_command() {
+  load_config
+
+  if daemon_running; then
+    printf 'Daemon: running (pid %s)\n' "$(cat "${pid_file}")"
+  else
+    echo "Daemon: stopped"
+  fi
+
+  if [[ -n "${XCV_PORT}" ]]; then
+    printf 'URL: %s\n' "$(daemon_url)"
+  fi
+
+  if curl -fsS "$(daemon_url)/health" >/dev/null 2>&1; then
+    echo "Health: ok"
+  else
+    echo "Health: unavailable"
+  fi
+}
+
+daemon_run_command() {
+  load_config
+  require_local_token
+  exec "${xcvd_path}" --host 127.0.0.1 --port "${XCV_PORT}" --token "${XCV_TOKEN}"
+}
+
+ssh_command() {
+  if ! ensure_daemon_started; then
+    exit 1
+  fi
+
+  local ssh_target=""
+  if (($# > 0)); then
+    ssh_target="$1"
+    shift
+  else
+    ssh_target="$(require_ssh_target)"
+  fi
+
+  if (($# == 0)); then
+    exec ssh \
+      -o ExitOnForwardFailure=yes \
+      -R "127.0.0.1:${XCV_PORT}:127.0.0.1:${XCV_PORT}" \
+      "${ssh_target}" \
+      'export PATH="$HOME/.local/bin:$HOME/bin:$PATH"; exec "${SHELL:-/bin/bash}" -l'
+  fi
+
+  exec ssh \
+    -o ExitOnForwardFailure=yes \
+    -R "127.0.0.1:${XCV_PORT}:127.0.0.1:${XCV_PORT}" \
+    "${ssh_target}" \
+    "$@"
+}
+
+run_ssh_with_forward() {
+  local ssh_target="$1"
+  shift
+
+  local control_path
+  control_path="$(ssh_control_path)"
+
+  ssh \
+    -o ExitOnForwardFailure=yes \
+    -o LogLevel=ERROR \
+    -o ControlMaster=auto \
+    -o ControlPersist=600 \
+    -o "ControlPath=${control_path}" \
+    -T \
+    -R "127.0.0.1:${XCV_PORT}:127.0.0.1:${XCV_PORT}" \
+    "${ssh_target}" \
+    "$@"
+}
+
+codex_paste_command() {
+  if ! ensure_daemon_started; then
+    exit 1
+  fi
+  load_config
+
+  local ssh_target=""
+  local output_format="path"
+  local should_copy="0"
+
+  if (($# > 0)) && [[ "${1}" != --* ]]; then
+    ssh_target="$1"
+    shift
+  fi
+
+  ssh_target="$(require_ssh_target "${ssh_target}")"
+
+  while (($# > 0)); do
+    case "$1" in
+      --copy)
+        should_copy="1"
+        shift
+        ;;
+      --format)
+        output_format="${2:?missing value for --format}"
+        shift 2
+        ;;
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      *)
+        echo "Unknown argument: $1" >&2
+        exit 1
+        ;;
+    esac
+  done
+
+  local quoted_remote_xcv quoted_remote_cache quoted_format remote_cmd
+  quoted_remote_xcv="$(quote_remote_word "${REMOTE_XCV_PATH}")"
+  quoted_remote_cache="$(quote_remote_word "${REMOTE_CACHE_DIR}")"
+  quoted_format="$(printf '%q' "${output_format}")"
+  remote_cmd="${quoted_remote_xcv} remote-fetch --dest-dir ${quoted_remote_cache} --name-prefix codex-clipboard --format ${quoted_format}"
+
+  local result
+  if ! result="$(run_ssh_with_forward "${ssh_target}" "${remote_cmd}")"; then
+    exit $?
+  fi
+
+  result="$(trim "${result}")"
+  if [[ -z "${result}" ]]; then
+    echo "Remote fetch returned an empty path." >&2
+    exit 1
+  fi
+
+  if [[ "${should_copy}" == "1" ]]; then
+    copy_text_to_local_clipboard "${result}"
+  fi
+
+  printf '%s\n' "${result}"
+}
+
+remote_fetch_command() {
+  load_config
+
+  local dest_dir="${REMOTE_CACHE_DIR/#\~/${HOME}}"
+  local name_prefix="codex-clipboard"
+  local output_format="path"
+
+  while (($# > 0)); do
+    case "$1" in
+      --dest-dir)
+        dest_dir="${2:?missing value for --dest-dir}"
+        shift 2
+        ;;
+      --name-prefix)
+        name_prefix="${2:?missing value for --name-prefix}"
+        shift 2
+        ;;
+      --format)
+        output_format="${2:?missing value for --format}"
+        shift 2
+        ;;
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      *)
+        echo "Unknown argument: $1" >&2
+        exit 1
+        ;;
+    esac
+  done
+
+  require_local_token
+  mkdir -p "${dest_dir}"
+
+  local tmp_file err_file
+  tmp_file="$(mktemp "${dest_dir}/.${name_prefix}-XXXXXX.png.part")"
+  err_file="$(mktemp "${dest_dir}/.${name_prefix}-XXXXXX.err")"
+
+  cleanup_remote_fetch() {
+    rm -f "${tmp_file}"
+    rm -f "${err_file}"
+  }
+  trap cleanup_remote_fetch EXIT
+
+  local http_code curl_status
+  if http_code="$(
+    curl -sS \
+      -w '%{http_code}' \
+      -H "Authorization: Bearer ${XCV_TOKEN}" \
+      -o "${tmp_file}" \
+      "$(daemon_url)/v1/clipboard.png" \
+      2>"${err_file}"
+  )"; then
+    curl_status=0
+  else
+    curl_status=$?
+  fi
+
+  if ((curl_status != 0)); then
+    local curl_error
+    curl_error="$(trim "$(cat "${err_file}" 2>/dev/null || true)")"
+    echo "${curl_error:-Unable to reach the forwarded xcv daemon. Start xcv daemon locally and connect with xcv ssh.}" >&2
+    exit 1
+  fi
+
+  case "${http_code}" in
+    200)
+      ;;
+    404)
+      echo "No image found in the local clipboard." >&2
+      exit 2
+      ;;
+    401)
+      echo "Remote host could not authenticate to the local xcv daemon." >&2
+      exit 1
+      ;;
+    503)
+      local service_error
+      service_error="$(trim "$(cat "${err_file}" 2>/dev/null || true)")"
+      echo "${service_error:-Local clipboard backend unavailable.}" >&2
+      exit 1
+      ;;
+    *)
+      local fetch_error
+      fetch_error="$(trim "$(cat "${err_file}" 2>/dev/null || true)")"
+      echo "${fetch_error:-Unable to fetch clipboard image from forwarded daemon (HTTP ${http_code}).}" >&2
+      exit 1
+      ;;
+  esac
+
+  if [[ ! -s "${tmp_file}" ]]; then
+    echo "Fetched clipboard image was empty." >&2
+    exit 2
+  fi
+
+  local timestamp path
+  timestamp="$(date +%Y%m%d-%H%M%S)"
+  path="${dest_dir}/${name_prefix}-${timestamp}.png"
+  mv "${tmp_file}" "${path}"
+  trap - EXIT
+
+  case "${output_format}" in
+    path)
+      printf '%s\n' "${path}"
+      ;;
+    file-url)
+      printf 'file://%s\n' "${path}"
+      ;;
+    *)
+      echo "Unsupported format: ${output_format}" >&2
+      exit 1
+      ;;
+  esac
+}
+
+real_xclip_path() {
+  load_config
+
+  if [[ -n "${XCV_REAL_XCLIP}" && -x "${XCV_REAL_XCLIP}" ]]; then
+    printf '%s\n' "${XCV_REAL_XCLIP}"
+    return 0
+  fi
+
+  for candidate in /usr/bin/xclip /bin/xclip; do
+    if [[ -x "${candidate}" ]]; then
+      printf '%s\n' "${candidate}"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+real_ssh_path() {
+  local candidate=""
+
+  for candidate in /usr/bin/ssh /bin/ssh; do
+    if [[ -x "${candidate}" ]]; then
+      printf '%s\n' "${candidate}"
+      return 0
+    fi
+  done
+
+  if candidate="$(command -v ssh 2>/dev/null)"; then
+    printf '%s\n' "${candidate}"
+    return 0
+  fi
+
+  return 1
+}
+
+install_ssh_integration() {
+  local ssh_dir ssh_config xcv_ssh_config local_xcv local_xcv_escaped control_path
+  ssh_dir="${HOME}/.ssh"
+  ssh_config="${ssh_dir}/config"
+  xcv_ssh_config="${ssh_dir}/xcv.conf"
+  local_xcv="${script_dir}/xcv"
+  local_xcv_escaped="$(printf '%q' "${local_xcv}")"
+  control_path="${config_dir}/control/%C"
+
+  mkdir -p "${ssh_dir}" "${config_dir}/control"
+  chmod 0700 "${ssh_dir}"
+
+  if [[ ! -f "${ssh_config}" ]]; then
+    touch "${ssh_config}"
+    chmod 0600 "${ssh_config}"
+  fi
+
+  if ! grep -Fqx 'Include ~/.ssh/xcv.conf' "${ssh_config}"; then
+    printf '\nInclude ~/.ssh/xcv.conf\n' >>"${ssh_config}"
+  fi
+
+  cat >"${xcv_ssh_config}" <<EOF
+# Managed by xcv. Remove this file or the Include line in ~/.ssh/config to disable.
+Match exec "test -t 0 && test -t 1"
+  ControlMaster auto
+  ControlPersist 600
+  ControlPath ${control_path}
+  RemoteForward 127.0.0.1:${XCV_PORT} 127.0.0.1:${XCV_PORT}
+  PermitLocalCommand yes
+  LocalCommand ${local_xcv_escaped} session-hook %n >/dev/null 2>&1 || true
+EOF
+  chmod 0600 "${xcv_ssh_config}"
+}
+
+run_bootstrap_ssh() {
+  local ssh_target="$1"
+  shift
+
+  local ssh_bin=""
+  if ! ssh_bin="$(real_ssh_path)"; then
+    echo "ssh is required for session-hook." >&2
+    return 1
+  fi
+
+  "${ssh_bin}" \
+    -o ControlMaster=auto \
+    -o ControlPersist=600 \
+    -o "ControlPath=$(ssh_control_path)" \
+    -o PermitLocalCommand=no \
+    -o ClearAllForwardings=yes \
+    -o LogLevel=ERROR \
+    "${ssh_target}" \
+    "$@"
+}
+
+run_maybe_quiet() {
+  local quiet="$1"
+  shift
+
+  if [[ "${quiet}" == "1" ]]; then
+    "$@" >/dev/null 2>&1
+  else
+    "$@"
+  fi
+}
+
+bootstrap_remote_host() {
+  load_config
+  require_local_token
+
+  local ssh_target="${1:-}"
+  local quiet="${2:-0}"
+  if [[ -z "${ssh_target}" ]]; then
+    echo "bootstrap_remote_host requires an SSH target." >&2
+    return 1
+  fi
+
+  local remote_real_xclip=""
+  if [[ "${quiet}" == "1" ]]; then
+    remote_real_xclip="$(
+      run_bootstrap_ssh "${ssh_target}" '
+        mkdir -p "$HOME/bin" "$HOME/.local/bin" "$HOME/.config/xcv" "$HOME/.cache/xcv" "$HOME/clipboard-uploads"
+        for candidate in /usr/bin/xclip /bin/xclip; do
+          if [ -x "$candidate" ]; then
+            printf "%s" "$candidate"
+            break
+          fi
+        done
+        exit 0
+      ' 2>/dev/null || true
+    )"
+  else
+    remote_real_xclip="$(
+      run_bootstrap_ssh "${ssh_target}" '
+        mkdir -p "$HOME/bin" "$HOME/.local/bin" "$HOME/.config/xcv" "$HOME/.cache/xcv" "$HOME/clipboard-uploads"
+        for candidate in /usr/bin/xclip /bin/xclip; do
+          if [ -x "$candidate" ]; then
+            printf "%s" "$candidate"
+            break
+          fi
+        done
+        exit 0
+      '
+    )"
+  fi
+
+  if [[ ! -f "${script_dir}/receive-clipboard-image" ]]; then
+    echo "Missing ${script_dir}/receive-clipboard-image. Reinstall xcv." >&2
+    return 1
+  fi
+
+  if [[ "${quiet}" == "1" ]]; then
+    run_bootstrap_ssh "${ssh_target}" 'umask 077 && cat > "$HOME/bin/xcv" && chmod 0755 "$HOME/bin/xcv"' <"${script_dir}/xcv" >/dev/null 2>&1 || return 1
+    run_bootstrap_ssh "${ssh_target}" 'umask 077 && cat > "$HOME/bin/receive-clipboard-image" && chmod 0755 "$HOME/bin/receive-clipboard-image"' <"${script_dir}/receive-clipboard-image" >/dev/null 2>&1 || return 1
+  else
+    run_bootstrap_ssh "${ssh_target}" 'umask 077 && cat > "$HOME/bin/xcv" && chmod 0755 "$HOME/bin/xcv"' <"${script_dir}/xcv"
+    run_bootstrap_ssh "${ssh_target}" 'umask 077 && cat > "$HOME/bin/receive-clipboard-image" && chmod 0755 "$HOME/bin/receive-clipboard-image"' <"${script_dir}/receive-clipboard-image"
+  fi
+
+  if [[ "${quiet}" == "1" ]]; then
+    run_bootstrap_ssh "${ssh_target}" 'bash -s' >/dev/null 2>&1 <<'EOF' || return 1
+set -euo pipefail
+
+ensure_link() {
+  local source="$1"
+  local target="$2"
+
+  if [[ -e "${target}" && ! -L "${target}" ]]; then
+    exit 0
+  fi
+
+  mkdir -p "$(dirname "${target}")"
+  ln -sfn "${source}" "${target}"
+}
+
+ensure_link "$HOME/bin/xcv" "$HOME/.local/bin/xcv"
+ensure_link "$HOME/bin/xcv" "$HOME/bin/xclip"
+ensure_link "$HOME/bin/xcv" "$HOME/.local/bin/xclip"
+EOF
+  else
+    run_bootstrap_ssh "${ssh_target}" 'bash -s' <<'EOF'
+set -euo pipefail
+
+ensure_link() {
+  local source="$1"
+  local target="$2"
+
+  if [[ -e "${target}" && ! -L "${target}" ]]; then
+    exit 0
+  fi
+
+  mkdir -p "$(dirname "${target}")"
+  ln -sfn "${source}" "${target}"
+}
+
+ensure_link "$HOME/bin/xcv" "$HOME/.local/bin/xcv"
+ensure_link "$HOME/bin/xcv" "$HOME/bin/xclip"
+ensure_link "$HOME/bin/xcv" "$HOME/.local/bin/xclip"
+EOF
+  fi
+
+  local remote_config=""
+  remote_config="$(cat <<EOF
+SSH_TARGET=''
+XCV_PORT=$(printf '%q' "${XCV_PORT}")
+XCV_TOKEN=$(printf '%q' "${XCV_TOKEN}")
+REMOTE_CACHE_DIR=$(printf '%q' "${REMOTE_CACHE_DIR}")
+REMOTE_XCV_PATH=$(printf '%q' "${REMOTE_XCV_PATH}")
+XCV_REAL_XCLIP=$(printf '%q' "${remote_real_xclip}")
+EOF
+)"
+
+  if [[ "${quiet}" == "1" ]]; then
+    printf '%s\n' "${remote_config}" | run_bootstrap_ssh "${ssh_target}" 'umask 077 && cat > "$HOME/.config/xcv/config" && chmod 0600 "$HOME/.config/xcv/config"' >/dev/null 2>&1 || return 1
+  else
+    printf '%s\n' "${remote_config}" | run_bootstrap_ssh "${ssh_target}" 'umask 077 && cat > "$HOME/.config/xcv/config" && chmod 0600 "$HOME/.config/xcv/config"'
+  fi
+
+  return 0
+}
+
+setup_command() {
+  load_config
+
+  local ssh_target="${1:-}"
+  if [[ -n "${ssh_target}" && "${ssh_target}" != --* ]]; then
+    shift
+  else
+    ssh_target=""
+  fi
+
+  while (($# > 0)); do
+    case "$1" in
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      *)
+        echo "Unknown argument: $1" >&2
+        exit 1
+        ;;
+    esac
+  done
+
+  if [[ -n "${ssh_target}" ]]; then
+    SSH_TARGET="${ssh_target}"
+  fi
+
+  SSH_TARGET="$(require_ssh_target)"
+
+  if [[ -z "${XCV_TOKEN}" ]]; then
+    XCV_TOKEN="$(random_token)"
+  fi
+
+  save_config
+  install_ssh_integration
+
+  if ! ensure_daemon_started; then
+    exit 1
+  fi
+
+  if ! bootstrap_remote_host "${SSH_TARGET}" "0"; then
+    echo "Failed to bootstrap ${SSH_TARGET}." >&2
+    exit 1
+  fi
+
+  cat <<EOF
+Done.
+
+Claude Code:
+  ssh ${SSH_TARGET}
+  Ctrl+V now uses your local clipboard over SSH.
+
+Codex:
+  xcv paste --copy
+  Then use your terminal's normal paste shortcut.
+EOF
+}
+
+session-hook_command() {
+  load_config
+  require_local_token
+
+  local ssh_target="${1:-}"
+  if [[ -z "${ssh_target}" ]]; then
+    echo "session-hook requires an SSH target." >&2
+    exit 1
+  fi
+
+  ensure_daemon_started 1 >/dev/null 2>&1 || true
+  bootstrap_remote_host "${ssh_target}" "1" || true
+}
+
+xclip_shim_should_intercept() {
+  local output_mode="0"
+  local selection=""
+  local target=""
+
+  while (($# > 0)); do
+    case "$1" in
+      -o|--output)
+        output_mode="1"
+        shift
+        ;;
+      -selection|--selection)
+        selection="${2:-}"
+        shift 2
+        ;;
+      -t|-target|--target)
+        target="${2:-}"
+        shift 2
+        ;;
+      *)
+        shift
+        ;;
+    esac
+  done
+
+  [[ "${output_mode}" == "1" ]] || return 1
+  [[ "${selection}" == "clipboard" ]] || return 1
+
+  case "${target}" in
+    TARGETS|image/png)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+xclip_shim_command() {
+  load_config
+  require_local_token
+
+  if xclip_shim_should_intercept "$@"; then
+    local target=""
+    local args=("$@")
+    local i=0
+    while ((i < ${#args[@]})); do
+      case "${args[$i]}" in
+        -t|-target|--target)
+          target="${args[$((i + 1))]:-}"
+          i=$((i + 2))
+          ;;
+        *)
+          i=$((i + 1))
+          ;;
+      esac
+    done
+
+    case "${target}" in
+      TARGETS)
+        printf 'image/png\n'
+        exit 0
+        ;;
+      image/png)
+        exec curl -fsS -H "Authorization: Bearer ${XCV_TOKEN}" "$(daemon_url)/v1/clipboard.png"
+        ;;
+    esac
+  fi
+
+  local real_xclip=""
+  if real_xclip="$(real_xclip_path)"; then
+    exec "${real_xclip}" "$@"
+  fi
+
+  echo "xclip is not installed on the remote host and the request was not image clipboard output." >&2
+  exit 1
+}
+
+doctor_command() {
+  load_config
+
+  printf 'Config: %s\n' "${config_file}"
+  printf 'SSH target: %s\n' "${SSH_TARGET:-<unset>}"
+  printf 'Port: %s\n' "${XCV_PORT:-<unset>}"
+  printf 'Remote cache dir: %s\n' "${REMOTE_CACHE_DIR:-<unset>}"
+  printf 'Remote xcv path: %s\n' "${REMOTE_XCV_PATH:-<unset>}"
+
+  if [[ -n "${XCV_TOKEN:-}" ]]; then
+    printf 'Token: set (%s…)\n' "${XCV_TOKEN:0:8}"
+  else
+    echo "Token: <unset>"
+  fi
+
+  if [[ -x "${xcvd_path}" ]]; then
+    printf 'Daemon binary: %s\n' "${xcvd_path}"
+    if backend="$("${xcvd_path}" --print-backend 2>/dev/null)"; then
+      printf 'Clipboard backend: %s\n' "${backend}"
+    else
+      echo "Clipboard backend: unavailable"
+    fi
+  else
+    echo "Daemon binary: missing"
+  fi
+
+  if daemon_running; then
+    printf 'Daemon process: running (pid %s)\n' "$(cat "${pid_file}")"
+  else
+    echo "Daemon process: stopped"
+  fi
+
+  if daemon_health >/dev/null 2>&1; then
+    echo "Daemon health: ok"
+  else
+    echo "Daemon health: unavailable"
+  fi
+}
+
+main() {
+  if [[ "${program_name}" == "xclip" ]]; then
+    xclip_shim_command "$@"
+    exit
+  fi
+
+  local command="${1:-}"
+  case "${command}" in
+    setup)
+      shift
+      setup_command "$@"
+      ;;
+    daemon)
+      shift
+      case "${1:-}" in
+        start)
+          shift
+          daemon_start_command "$@"
+          ;;
+        stop)
+          shift
+          daemon_stop_command "$@"
+          ;;
+        status)
+          shift
+          daemon_status_command "$@"
+          ;;
+        run)
+          shift
+          daemon_run_command "$@"
+          ;;
+        *)
+          usage >&2
+          exit 1
+          ;;
+      esac
+      ;;
+    ssh)
+      shift
+      ssh_command "$@"
+      ;;
+    paste)
+      shift
+      codex_paste_command "$@"
+      ;;
+    codex-paste)
+      shift
+      codex_paste_command "$@"
+      ;;
+    remote-fetch)
+      shift
+      remote_fetch_command "$@"
+      ;;
+    session-hook)
+      shift
+      session_hook_command "$@"
+      ;;
+    doctor)
+      shift
+      doctor_command "$@"
+      ;;
+    config-path)
+      printf '%s\n' "${config_file}"
+      ;;
+    -h|--help|"")
+      usage
+      ;;
+    *)
+      echo "Unknown command: ${command}" >&2
+      usage >&2
+      exit 1
+      ;;
+  esac
+}
+
+main "$@"

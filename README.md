@@ -1,2 +1,81 @@
 # xcv
+
 Paste images into remote Claude Code and Codex over SSH from your local clipboard.
+
+`xcv` keeps the transport simple:
+
+- Claude Code: local clipboard daemon + SSH remote forward + remote `xclip` shim
+- Codex: upload the clipboard image to the remote host, then paste the remote path
+
+No X11 forwarding. No terminal-specific transport. Works over plain SSH.
+
+## Quick Start
+
+```bash
+# Install
+curl -fsSL https://raw.githubusercontent.com/tthuwng/xcv/main/scripts/install.sh | sh
+
+# Setup (one command does everything)
+xcv setup myserver
+```
+
+Done. `Ctrl+V` in remote Claude Code now pastes images from your local machine.
+
+For Codex, run:
+
+```bash
+xcv paste --copy
+```
+
+Then use your terminal's normal paste shortcut in Codex.
+
+## What `xcv setup` does
+
+- writes `~/.config/xcv/config`
+- installs `~/.ssh/xcv.conf` and adds an `Include` line to `~/.ssh/config`
+- starts the local clipboard daemon
+- bootstraps the remote `xcv` helper and `xclip` shim on the target host
+- stores the host you passed as the default target for `xcv paste --copy`
+
+After setup, plain interactive `ssh myserver` sessions automatically get the remote forward and on-demand remote bootstrap.
+
+If a host disallows remote forwarding, SSH still works normally; only clipboard forwarding is unavailable on that host.
+
+## Commands
+
+```bash
+xcv setup HOST
+xcv paste --copy
+xcv doctor
+```
+
+`xcv paste` is an alias for `xcv codex-paste`.
+
+## Hotkeys
+
+The hotkey still runs locally because the clipboard lives on your laptop.
+
+- macOS Hammerspoon example: `local/macos/hammerspoon-paste-image.lua.example`
+- Linux X11 AutoKey example: `local/linux-x11/autokey-paste-image.py.example`
+
+Both examples assume you already ran `xcv setup HOST`, so `xcv paste --copy` can use the saved default host.
+
+## Requirements
+
+Local machine:
+
+- macOS: `pngpaste`
+- Linux Wayland: `wl-clipboard`
+- Linux X11: `xclip`
+
+Remote host:
+
+- `ssh`
+- `curl`
+- `bash`
+
+## Notes
+
+- `xcv setup HOST` is the main entrypoint.
+- `xcv ssh HOST` still exists if you want an explicit wrapper instead of automatic SSH integration.
+- Codex cannot be made fully host-agnostic from a bare `Ctrl+V` alone, because the local uploader still needs to know which remote host should receive the image.

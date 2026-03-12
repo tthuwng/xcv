@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: receive-clipboard-image [--dir PATH] [--ext EXT] [--name-prefix PREFIX]
+
+Reads image bytes from stdin, stores them on disk, and prints the saved path.
+EOF
+}
+
+dest_dir="$PWD"
+ext="png"
+name_prefix="pasted-image"
+
+while (($# > 0)); do
+  case "$1" in
+    --dir)
+      dest_dir="${2:?missing value for --dir}"
+      shift 2
+      ;;
+    --ext)
+      ext="${2:?missing value for --ext}"
+      shift 2
+      ;;
+    --name-prefix)
+      name_prefix="${2:?missing value for --name-prefix}"
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "Unknown argument: $1" >&2
+      usage >&2
+      exit 1
+      ;;
+  esac
+done
+
+ext="${ext#.}"
+
+mkdir -p "$dest_dir"
+dest_dir="$(cd "$dest_dir" && pwd -P)"
+
+timestamp="$(date +%Y%m%d-%H%M%S)"
+path="${dest_dir}/${name_prefix}-${timestamp}.${ext}"
+tmp_path="${path}.part"
+
+umask 077
+cat >"$tmp_path"
+
+if [[ ! -s "$tmp_path" ]]; then
+  rm -f "$tmp_path"
+  echo "No image data received on stdin" >&2
+  exit 1
+fi
+
+mv "$tmp_path" "$path"
+printf '%s\n' "$path"
