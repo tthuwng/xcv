@@ -6,6 +6,8 @@ program_name="$(basename "${0}")"
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 config_dir="${XDG_CONFIG_HOME:-${HOME}/.config}/xcv"
 config_file="${config_dir}/config"
+known_hosts_file="${config_dir}/known_hosts"
+latest_image_file="${config_dir}/latest-clipboard.png"
 pid_file="${config_dir}/daemon.pid"
 log_file="${config_dir}/daemon.log"
 watch_pid_file="${config_dir}/watch.pid"
@@ -21,7 +23,7 @@ Usage:
   xcv ssh [HOST] [SSH_ARGS...]
   xcv paste [HOST] [--copy] [--format path|file-url]
   xcv codex-paste [HOST] [--copy] [--format path|file-url]
-  xcv remote-fetch [--dest-dir PATH] [--name-prefix PREFIX] [--format path|file-url]
+  xcv remote-fetch [--dest-dir PATH | --path PATH] [--name-prefix PREFIX] [--format path|file-url]
   xcv session-hook HOST
   xcv doctor
   xcv config-path
@@ -193,6 +195,52 @@ require_ssh_target() {
   printf '%s\n' "${target}"
 }
 
+remember_known_host() {
+  local host="$1"
+
+  [[ -n "${host}" ]] || return 0
+  mkdir -p "${config_dir}"
+  touch "${known_hosts_file}"
+
+  if grep -Fqx "${host}" "${known_hosts_file}" 2>/dev/null; then
+    return 0
+  fi
+
+  printf '%s\n' "${host}" >>"${known_hosts_file}"
+}
+
+list_known_hosts() {
+  if [[ -f "${known_hosts_file}" ]]; then
+    cat "${known_hosts_file}"
+  fi
+}
+
+ssh_control_check() {
+  local ssh_target="$1"
+  local ssh_bin=""
+
+  if ! ssh_bin="$(real_ssh_path)"; then
+    return 1
+  fi
+
+  "${ssh_bin}" \
+    -o ControlMaster=no \
+    -o ControlPath="$(ssh_control_path)" \
+    -O check \
+    "${ssh_target}" >/dev/null 2>&1
+}
+
+list_active_hosts() {
+  local host=""
+
+  while IFS= read -r host; do
+    [[ -n "${host}" ]] || continue
+    if ssh_control_check "${host}"; then
+      printf '%s\n' "${host}"
+    fi
+  done < <(list_known_hosts)
+}
+
 detect_local_image_clipboard_backend() {
   if [[ ! -x "${xcvd_path}" ]]; then
     return 1
@@ -318,15 +366,127 @@ fetch_remote_clipboard_path() {
   local ssh_target="$1"
   local output_format="${2:-path}"
   local name_prefix="${3:-codex-clipboard}"
+  local exact_path="${4:-}"
 
-  local quoted_remote_xcv quoted_remote_cache quoted_format quoted_name_prefix remote_cmd
+  local quoted_remote_xcv quoted_remote_cache quoted_format quoted_name_prefix quoted_exact_path remote_cmd
   quoted_remote_xcv="$(quote_remote_word "${REMOTE_XCV_PATH}")"
-  quoted_remote_cache="$(quote_remote_word "${REMOTE_CACHE_DIR}")"
   quoted_format="$(printf '%q' "${output_format}")"
-  quoted_name_prefix="$(printf '%q' "${name_prefix}")"
-  remote_cmd="${quoted_remote_xcv} remote-fetch --dest-dir ${quoted_remote_cache} --name-prefix ${quoted_name_prefix} --format ${quoted_format}"
+
+  if [[ -n "${exact_path}" ]]; then
+    quoted_exact_path="$(printf '%q' "${exact_path}")"
+    remote_cmd="${quoted_remote_xcv} remote-fetch --path ${quoted_exact_path} --format ${quoted_format}"
+  else
+    quoted_remote_cache="$(quote_remote_word "${REMOTE_CACHE_DIR}")"
+    quoted_name_prefix="$(printf '%q' "${name_prefix}")"
+    remote_cmd="${quoted_remote_xcv} remote-fetch --dest-dir ${quoted_remote_cache} --name-prefix ${quoted_name_prefix} --format ${quoted_format}"
+  fi
 
   run_ssh_with_forward "${ssh_target}" "${remote_cmd}"
+}
+
+shared_remote_clipboard_path() {
+  local token_prefix="${XCV_TOKEN:0:12}"
+  printf '/tmp/xcv-%s/current.png\n' "${token_prefix}"
+}
+
+resolve_codex_target_hosts() {
+  local preferred_host="${1:-}"
+
+  if [[ -n "${preferred_host}" ]]; then
+    printf '%s\n' "${preferred_host}"
+    return 0
+  fi
+
+  local active_hosts=""
+  active_hosts="$(list_active_hosts || true)"
+  if [[ -n "${active_hosts}" ]]; then
+    printf '%s\n' "${active_hosts}"
+    return 0
+  fi
+
+  require_ssh_target
+}
+
+broadcast_remote_clipboard_path() {
+  local preferred_host="${1:-}"
+  local output_format="${2:-path}"
+  local name_prefix="${3:-codex-clipboard}"
+  local exact_path="${4:-}"
+
+  local shared_path=""
+  if [[ -n "${exact_path}" ]]; then
+    shared_path="${exact_path}"
+  fi
+
+  local hosts=()
+  local host=""
+  while IFS= read -r host; do
+    [[ -n "${host}" ]] || continue
+    hosts+=("${host}")
+  done < <(resolve_codex_target_hosts "${preferred_host}")
+
+  if ((${#hosts[@]} == 0)); then
+    echo "No SSH target is available for Codex paste." >&2
+    return 1
+  fi
+
+  local first_result=""
+  local success_count=0
+
+  for host in "${hosts[@]}"; do
+    local result=""
+    if result="$(fetch_remote_clipboard_path "${host}" "${output_format}" "${name_prefix}" "${shared_path}")"; then
+      result="$(trim "${result}")"
+      if [[ -z "${first_result}" && -n "${result}" ]]; then
+        first_result="${result}"
+      fi
+      success_count=$((success_count + 1))
+    elif [[ -n "${preferred_host}" ]]; then
+      return 1
+    fi
+  done
+
+  if ((success_count == 0)); then
+    echo "Failed to upload clipboard image to any active SSH host." >&2
+    return 1
+  fi
+
+  if [[ -z "${first_result}" ]]; then
+    echo "Remote fetch returned an empty path." >&2
+    return 1
+  fi
+
+  printf '%s\n' "${first_result}"
+}
+
+save_latest_clipboard_image() {
+  local source_path="$1"
+
+  mkdir -p "${config_dir}"
+  cp "${source_path}" "${latest_image_file}"
+  chmod 0600 "${latest_image_file}"
+}
+
+sync_latest_image_to_host() {
+  local ssh_target="$1"
+
+  if [[ ! -f "${latest_image_file}" ]]; then
+    return 0
+  fi
+
+  local remote_path remote_dir remote_part
+  remote_path="$(shared_remote_clipboard_path)"
+  remote_dir="$(dirname "${remote_path}")"
+  remote_part="${remote_path}.part"
+
+  local quoted_remote_dir quoted_remote_path quoted_remote_part
+  quoted_remote_dir="$(printf '%q' "${remote_dir}")"
+  quoted_remote_path="$(printf '%q' "${remote_path}")"
+  quoted_remote_part="$(printf '%q' "${remote_part}")"
+
+  run_bootstrap_ssh "${ssh_target}" \
+    "umask 077 && mkdir -p ${quoted_remote_dir} && cat > ${quoted_remote_part} && mv ${quoted_remote_part} ${quoted_remote_path}" \
+    <"${latest_image_file}"
 }
 
 copy_text_to_local_clipboard() {
@@ -474,6 +634,7 @@ run_ssh_with_forward() {
 codex_paste_command() {
   load_config
   require_local_image_clipboard_backend
+  require_local_token
 
   if ! ensure_daemon_started; then
     exit 1
@@ -488,7 +649,9 @@ codex_paste_command() {
     shift
   fi
 
-  ssh_target="$(require_ssh_target "${ssh_target}")"
+  if [[ -n "${ssh_target}" ]]; then
+    ssh_target="$(require_ssh_target "${ssh_target}")"
+  fi
 
   while (($# > 0)); do
     case "$1" in
@@ -511,10 +674,32 @@ codex_paste_command() {
     esac
   done
 
+  local shared_path
+  shared_path="$(shared_remote_clipboard_path)"
+  local snapshot_file=""
+  snapshot_file="$(mktemp "${TMPDIR:-/tmp}/xcv-paste.XXXXXX.png")"
+
+  if fetch_local_clipboard_png "${snapshot_file}"; then
+    save_latest_clipboard_image "${snapshot_file}"
+  else
+    local snapshot_status=$?
+    rm -f "${snapshot_file}"
+    case "${snapshot_status}" in
+      2)
+        echo "No image found in the local clipboard." >&2
+        ;;
+      *)
+        ;;
+    esac
+    exit "${snapshot_status}"
+  fi
+
   local result
-  if ! result="$(fetch_remote_clipboard_path "${ssh_target}" "${output_format}" "codex-clipboard")"; then
+  if ! result="$(broadcast_remote_clipboard_path "${ssh_target}" "${output_format}" "codex-clipboard" "${shared_path}")"; then
+    rm -f "${snapshot_file}"
     exit $?
   fi
+  rm -f "${snapshot_file}"
 
   result="$(trim "${result}")"
   if [[ -z "${result}" ]]; then
@@ -562,7 +747,9 @@ watch_start_command() {
   if [[ -n "${watch_host}" ]]; then
     require_ssh_target "${watch_host}" >/dev/null
   else
-    require_ssh_target >/dev/null
+    if [[ -z "$(list_active_hosts || true)" ]]; then
+      require_ssh_target >/dev/null
+    fi
   fi
 
   if watch_running; then
@@ -623,6 +810,14 @@ watch_status_command() {
     echo "Watch: stopped"
   fi
 
+  local active_hosts
+  active_hosts="$(list_active_hosts || true)"
+  if [[ -n "${active_hosts}" ]]; then
+    printf 'Active SSH hosts: %s\n' "$(printf '%s' "${active_hosts}" | paste -sd ',' -)"
+  else
+    echo "Active SSH hosts: none"
+  fi
+
   printf 'Watch log: %s\n' "${watch_log_file}"
 }
 
@@ -662,16 +857,11 @@ watch_run_command() {
 
   local last_image_hash=""
   local tmp_file
+  local shared_path
+  shared_path="$(shared_remote_clipboard_path)"
 
   while true; do
     load_config
-
-    local ssh_target=""
-    if [[ -n "${watch_host}" ]]; then
-      ssh_target="${watch_host}"
-    else
-      ssh_target="$(require_ssh_target)"
-    fi
 
     tmp_file="$(mktemp "${TMPDIR:-/tmp}/xcv-watch.XXXXXX.png")"
 
@@ -681,14 +871,19 @@ watch_run_command() {
 
       if [[ "${image_hash}" != "${last_image_hash}" ]]; then
         local remote_path
-        if remote_path="$(fetch_remote_clipboard_path "${ssh_target}" "path" "codex-clipboard")"; then
+        save_latest_clipboard_image "${tmp_file}"
+        if remote_path="$(broadcast_remote_clipboard_path "${watch_host}" "path" "codex-clipboard" "${shared_path}")"; then
           remote_path="$(trim "${remote_path}")"
           if [[ -n "${remote_path}" ]]; then
             copy_text_to_local_clipboard "${remote_path}"
             printf '[%s] uploaded clipboard image to %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "${remote_path}"
           fi
         else
-          printf '[%s] upload failed for host %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "${ssh_target}" >&2
+          if [[ -n "${watch_host}" ]]; then
+            printf '[%s] upload failed for host %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "${watch_host}" >&2
+          else
+            printf '[%s] upload failed for active xcv SSH hosts\n' "$(date '+%Y-%m-%d %H:%M:%S')" >&2
+          fi
         fi
         last_image_hash="${image_hash}"
       fi
@@ -712,11 +907,16 @@ remote_fetch_command() {
   load_config
 
   local dest_dir="${REMOTE_CACHE_DIR/#\~/${HOME}}"
+  local exact_path=""
   local name_prefix="codex-clipboard"
   local output_format="path"
 
   while (($# > 0)); do
     case "$1" in
+      --path)
+        exact_path="${2:?missing value for --path}"
+        shift 2
+        ;;
       --dest-dir)
         dest_dir="${2:?missing value for --dest-dir}"
         shift 2
@@ -741,11 +941,20 @@ remote_fetch_command() {
   done
 
   require_local_token
-  mkdir -p "${dest_dir}"
+  if [[ -n "${exact_path}" ]]; then
+    mkdir -p "$(dirname "${exact_path}")"
+  else
+    mkdir -p "${dest_dir}"
+  fi
 
   local tmp_file err_file
-  tmp_file="$(mktemp "${dest_dir}/.${name_prefix}-XXXXXX.png.part")"
-  err_file="$(mktemp "${dest_dir}/.${name_prefix}-XXXXXX.err")"
+  if [[ -n "${exact_path}" ]]; then
+    tmp_file="$(mktemp "$(dirname "${exact_path}")/.${name_prefix}-XXXXXX.png.part")"
+    err_file="$(mktemp "$(dirname "${exact_path}")/.${name_prefix}-XXXXXX.err")"
+  else
+    tmp_file="$(mktemp "${dest_dir}/.${name_prefix}-XXXXXX.png.part")"
+    err_file="$(mktemp "${dest_dir}/.${name_prefix}-XXXXXX.err")"
+  fi
 
   cleanup_remote_fetch() {
     rm -f "${tmp_file}"
@@ -805,8 +1014,12 @@ remote_fetch_command() {
   fi
 
   local timestamp path
-  timestamp="$(date +%Y%m%d-%H%M%S)"
-  path="${dest_dir}/${name_prefix}-${timestamp}.png"
+  if [[ -n "${exact_path}" ]]; then
+    path="${exact_path}"
+  else
+    timestamp="$(date +%Y%m%d-%H%M%S)"
+    path="${dest_dir}/${name_prefix}-${timestamp}.png"
+  fi
   mv "${tmp_file}" "${path}"
   trap - EXIT
 
@@ -1069,6 +1282,7 @@ setup_command() {
   fi
 
   SSH_TARGET="$(require_ssh_target)"
+  remember_known_host "${SSH_TARGET}"
 
   if [[ -z "${XCV_TOKEN}" ]]; then
     XCV_TOKEN="$(random_token)"
@@ -1096,7 +1310,7 @@ Claude Code:
   Ctrl+V now uses your local clipboard over SSH.
 
 Codex:
-  Auto mode: xcv watch start
+  Auto mode across active xcv SSH sessions: xcv watch start
   xcv paste --copy
   Then use your terminal's normal paste shortcut.
 EOF
@@ -1112,8 +1326,10 @@ session_hook_command() {
     exit 1
   fi
 
+  remember_known_host "${ssh_target}"
   ensure_daemon_started 1 >/dev/null 2>&1 || true
   bootstrap_remote_host "${ssh_target}" "1" || true
+  sync_latest_image_to_host "${ssh_target}" >/dev/null 2>&1 || true
 }
 
 xclip_shim_should_intercept() {
@@ -1197,11 +1413,28 @@ xclip_shim_command() {
 doctor_command() {
   load_config
 
+  local active_hosts known_hosts_csv
+  active_hosts="$(list_active_hosts || true)"
+  known_hosts_csv=""
+  if [[ -f "${known_hosts_file}" ]]; then
+    known_hosts_csv="$(paste -sd ',' "${known_hosts_file}")"
+  fi
+
   printf 'Config: %s\n' "${config_file}"
   printf 'SSH target: %s\n' "${SSH_TARGET:-<unset>}"
   printf 'Port: %s\n' "${XCV_PORT:-<unset>}"
   printf 'Remote cache dir: %s\n' "${REMOTE_CACHE_DIR:-<unset>}"
   printf 'Remote xcv path: %s\n' "${REMOTE_XCV_PATH:-<unset>}"
+  if [[ -n "${known_hosts_csv}" ]]; then
+    printf 'Known SSH hosts: %s\n' "${known_hosts_csv}"
+  else
+    echo "Known SSH hosts: <unset>"
+  fi
+  if [[ -n "${active_hosts}" ]]; then
+    printf 'Active SSH hosts: %s\n' "$(printf '%s' "${active_hosts}" | paste -sd ',' -)"
+  else
+    echo "Active SSH hosts: none"
+  fi
 
   if [[ -n "${XCV_TOKEN:-}" ]]; then
     printf 'Token: set (%s…)\n' "${XCV_TOKEN:0:8}"
