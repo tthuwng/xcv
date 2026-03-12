@@ -75,6 +75,13 @@ main() {
     echo "  ${xcv_cmd} setup myserver"
     echo ""
 
+    if [ "$(uname -s)" = "Darwin" ] && ! command -v pngpaste >/dev/null 2>&1; then
+        echo "macOS note:"
+        echo "  Install pngpaste for image clipboard support:"
+        echo "  brew install pngpaste"
+        echo ""
+    fi
+
     if ! in_path "$install_dir"; then
         echo "Add to your PATH if you want to run \`xcv\` directly:"
         echo "  export PATH=\"${install_dir}:\$PATH\""

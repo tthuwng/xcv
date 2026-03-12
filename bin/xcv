@@ -179,6 +179,51 @@ require_ssh_target() {
   printf '%s\n' "${target}"
 }
 
+detect_local_image_clipboard_backend() {
+  if [[ ! -x "${xcvd_path}" ]]; then
+    return 1
+  fi
+
+  "${xcvd_path}" --print-backend 2>/dev/null || true
+}
+
+print_local_image_clipboard_help() {
+  case "$(uname -s)" in
+    Darwin)
+      echo "Install pngpaste first: brew install pngpaste" >&2
+      ;;
+    Linux)
+      if [[ -n "${WAYLAND_DISPLAY:-}" || "${XDG_SESSION_TYPE:-}" == "wayland" ]]; then
+        echo "Install wl-clipboard first." >&2
+      else
+        echo "Install xclip first." >&2
+      fi
+      ;;
+    *)
+      echo "Install a supported local clipboard image backend." >&2
+      ;;
+  esac
+}
+
+warn_if_local_image_clipboard_backend_missing() {
+  if [[ -n "$(detect_local_image_clipboard_backend)" ]]; then
+    return 0
+  fi
+
+  echo "Warning: local image clipboard backend is unavailable." >&2
+  print_local_image_clipboard_help
+}
+
+require_local_image_clipboard_backend() {
+  if [[ -n "$(detect_local_image_clipboard_backend)" ]]; then
+    return 0
+  fi
+
+  echo "No local image clipboard backend found." >&2
+  print_local_image_clipboard_help
+  exit 1
+}
+
 copy_text_to_local_clipboard() {
   local text="$1"
 
@@ -322,10 +367,12 @@ run_ssh_with_forward() {
 }
 
 codex_paste_command() {
+  load_config
+  require_local_image_clipboard_backend
+
   if ! ensure_daemon_started; then
     exit 1
   fi
-  load_config
 
   local ssh_target=""
   local output_format="path"
@@ -756,6 +803,8 @@ setup_command() {
     exit 1
   fi
 
+  warn_if_local_image_clipboard_backend_missing
+
   if ! bootstrap_remote_host "${SSH_TARGET}" "0"; then
     echo "Failed to bootstrap ${SSH_TARGET}." >&2
     exit 1
@@ -887,6 +936,7 @@ doctor_command() {
       printf 'Clipboard backend: %s\n' "${backend}"
     else
       echo "Clipboard backend: unavailable"
+      print_local_image_clipboard_help
     fi
   else
     echo "Daemon binary: missing"
