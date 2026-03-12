@@ -8,6 +8,8 @@ config_dir="${XDG_CONFIG_HOME:-${HOME}/.config}/xcv"
 config_file="${config_dir}/config"
 pid_file="${config_dir}/daemon.pid"
 log_file="${config_dir}/daemon.log"
+watch_pid_file="${config_dir}/watch.pid"
+watch_log_file="${config_dir}/watch.log"
 xcvd_path="${script_dir}/xcvd"
 
 usage() {
@@ -15,6 +17,7 @@ usage() {
 Usage:
   xcv setup HOST
   xcv daemon start|stop|status|run
+  xcv watch start|stop|status|run [HOST] [--interval SECONDS]
   xcv ssh [HOST] [SSH_ARGS...]
   xcv paste [HOST] [--copy] [--format path|file-url]
   xcv codex-paste [HOST] [--copy] [--format path|file-url]
@@ -26,6 +29,7 @@ Usage:
 Commands:
   setup        Configure SSH integration, start the daemon, and bootstrap a host
   daemon       Manage the local clipboard daemon used by both Codex and Claude
+  watch        Automatically upload copied images for Codex and replace clipboard with the remote path
   ssh          Open SSH with the required remote forward for Claude image paste
   paste        Alias for codex-paste
   codex-paste  Fetch the clipboard image onto the remote host and print its path
@@ -163,6 +167,16 @@ daemon_running() {
   [[ -n "${pid}" ]] && kill -0 "${pid}" 2>/dev/null
 }
 
+watch_running() {
+  if [[ ! -f "${watch_pid_file}" ]]; then
+    return 1
+  fi
+
+  local pid
+  pid="$(cat "${watch_pid_file}")"
+  [[ -n "${pid}" ]] && kill -0 "${pid}" 2>/dev/null
+}
+
 require_local_token() {
   if [[ -z "${XCV_TOKEN}" ]]; then
     echo "XCV_TOKEN is not set. Run xcv setup HOST first." >&2
@@ -222,6 +236,97 @@ require_local_image_clipboard_backend() {
   echo "No local image clipboard backend found." >&2
   print_local_image_clipboard_help
   exit 1
+}
+
+sha256_file() {
+  local path="$1"
+
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "${path}" | awk '{print $1}'
+    return 0
+  fi
+
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "${path}" | awk '{print $1}'
+    return 0
+  fi
+
+  if command -v openssl >/dev/null 2>&1; then
+    openssl dgst -sha256 "${path}" | awk '{print $NF}'
+    return 0
+  fi
+
+  echo "No SHA-256 tool found. Install shasum, sha256sum, or openssl." >&2
+  exit 1
+}
+
+fetch_local_clipboard_png() {
+  local output_path="$1"
+  local err_file http_code curl_status
+  err_file="$(mktemp "${TMPDIR:-/tmp}/xcv-clipboard.XXXXXX.err")"
+
+  if http_code="$(
+    curl -sS \
+      -w '%{http_code}' \
+      -H "Authorization: Bearer ${XCV_TOKEN}" \
+      -o "${output_path}" \
+      "$(daemon_url)/v1/clipboard.png" \
+      2>"${err_file}"
+  )"; then
+    curl_status=0
+  else
+    curl_status=$?
+  fi
+
+  if ((curl_status != 0)); then
+    local curl_error
+    curl_error="$(trim "$(cat "${err_file}" 2>/dev/null || true)")"
+    rm -f "${err_file}"
+    echo "${curl_error:-Unable to reach the local xcv daemon.}" >&2
+    return 1
+  fi
+
+  rm -f "${err_file}"
+
+  case "${http_code}" in
+    200)
+      if [[ ! -s "${output_path}" ]]; then
+        echo "Fetched clipboard image was empty." >&2
+        return 1
+      fi
+      return 0
+      ;;
+    404)
+      return 2
+      ;;
+    401)
+      echo "Local xcv daemon rejected the request." >&2
+      return 1
+      ;;
+    503)
+      echo "Local clipboard backend unavailable." >&2
+      return 3
+      ;;
+    *)
+      echo "Unable to fetch clipboard image from local daemon (HTTP ${http_code})." >&2
+      return 1
+      ;;
+  esac
+}
+
+fetch_remote_clipboard_path() {
+  local ssh_target="$1"
+  local output_format="${2:-path}"
+  local name_prefix="${3:-codex-clipboard}"
+
+  local quoted_remote_xcv quoted_remote_cache quoted_format quoted_name_prefix remote_cmd
+  quoted_remote_xcv="$(quote_remote_word "${REMOTE_XCV_PATH}")"
+  quoted_remote_cache="$(quote_remote_word "${REMOTE_CACHE_DIR}")"
+  quoted_format="$(printf '%q' "${output_format}")"
+  quoted_name_prefix="$(printf '%q' "${name_prefix}")"
+  remote_cmd="${quoted_remote_xcv} remote-fetch --dest-dir ${quoted_remote_cache} --name-prefix ${quoted_name_prefix} --format ${quoted_format}"
+
+  run_ssh_with_forward "${ssh_target}" "${remote_cmd}"
 }
 
 copy_text_to_local_clipboard() {
@@ -406,14 +511,8 @@ codex_paste_command() {
     esac
   done
 
-  local quoted_remote_xcv quoted_remote_cache quoted_format remote_cmd
-  quoted_remote_xcv="$(quote_remote_word "${REMOTE_XCV_PATH}")"
-  quoted_remote_cache="$(quote_remote_word "${REMOTE_CACHE_DIR}")"
-  quoted_format="$(printf '%q' "${output_format}")"
-  remote_cmd="${quoted_remote_xcv} remote-fetch --dest-dir ${quoted_remote_cache} --name-prefix codex-clipboard --format ${quoted_format}"
-
   local result
-  if ! result="$(run_ssh_with_forward "${ssh_target}" "${remote_cmd}")"; then
+  if ! result="$(fetch_remote_clipboard_path "${ssh_target}" "${output_format}" "codex-clipboard")"; then
     exit $?
   fi
 
@@ -428,6 +527,185 @@ codex_paste_command() {
   fi
 
   printf '%s\n' "${result}"
+}
+
+watch_start_command() {
+  load_config
+  require_local_image_clipboard_backend
+  require_local_token
+
+  local watch_host=""
+  local interval="0.75"
+
+  if (($# > 0)) && [[ "${1}" != --* ]]; then
+    watch_host="$1"
+    shift
+  fi
+
+  while (($# > 0)); do
+    case "$1" in
+      --interval)
+        interval="${2:?missing value for --interval}"
+        shift 2
+        ;;
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      *)
+        echo "Unknown argument: $1" >&2
+        exit 1
+        ;;
+    esac
+  done
+
+  if [[ -n "${watch_host}" ]]; then
+    require_ssh_target "${watch_host}" >/dev/null
+  else
+    require_ssh_target >/dev/null
+  fi
+
+  if watch_running; then
+    echo "xcv watch is already running (pid $(cat "${watch_pid_file}" 2>/dev/null || echo '?'))."
+    exit 0
+  fi
+
+  mkdir -p "${config_dir}"
+
+  local watch_cmd=("${script_dir}/xcv" watch run)
+  if [[ -n "${watch_host}" ]]; then
+    watch_cmd+=("${watch_host}")
+  fi
+  watch_cmd+=("--interval" "${interval}")
+
+  nohup "${watch_cmd[@]}" >>"${watch_log_file}" 2>&1 &
+
+  echo "$!" >"${watch_pid_file}"
+
+  for _ in 1 2 3 4 5; do
+    if watch_running; then
+      echo "xcv watch started (pid $(cat "${watch_pid_file}"))."
+      return 0
+    fi
+    sleep 0.2
+  done
+
+  echo "Failed to start xcv watch. See ${watch_log_file}." >&2
+  return 1
+}
+
+watch_stop_command() {
+  if ! watch_running; then
+    rm -f "${watch_pid_file}"
+    echo "xcv watch is not running."
+    exit 0
+  fi
+
+  local pid
+  pid="$(cat "${watch_pid_file}")"
+  kill "${pid}" 2>/dev/null || true
+
+  for _ in 1 2 3 4 5; do
+    if ! kill -0 "${pid}" 2>/dev/null; then
+      break
+    fi
+    sleep 0.2
+  done
+
+  rm -f "${watch_pid_file}"
+  echo "xcv watch stopped."
+}
+
+watch_status_command() {
+  if watch_running; then
+    printf 'Watch: running (pid %s)\n' "$(cat "${watch_pid_file}")"
+  else
+    echo "Watch: stopped"
+  fi
+
+  printf 'Watch log: %s\n' "${watch_log_file}"
+}
+
+watch_run_command() {
+  load_config
+  require_local_image_clipboard_backend
+  require_local_token
+
+  local watch_host=""
+  local interval="0.75"
+
+  if (($# > 0)) && [[ "${1}" != --* ]]; then
+    watch_host="$1"
+    shift
+  fi
+
+  while (($# > 0)); do
+    case "$1" in
+      --interval)
+        interval="${2:?missing value for --interval}"
+        shift 2
+        ;;
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      *)
+        echo "Unknown argument: $1" >&2
+        exit 1
+        ;;
+    esac
+  done
+
+  if ! ensure_daemon_started 1; then
+    exit 1
+  fi
+
+  local last_image_hash=""
+  local tmp_file
+
+  while true; do
+    load_config
+
+    local ssh_target=""
+    if [[ -n "${watch_host}" ]]; then
+      ssh_target="${watch_host}"
+    else
+      ssh_target="$(require_ssh_target)"
+    fi
+
+    tmp_file="$(mktemp "${TMPDIR:-/tmp}/xcv-watch.XXXXXX.png")"
+
+    if fetch_local_clipboard_png "${tmp_file}"; then
+      local image_hash
+      image_hash="$(sha256_file "${tmp_file}")"
+
+      if [[ "${image_hash}" != "${last_image_hash}" ]]; then
+        local remote_path
+        if remote_path="$(fetch_remote_clipboard_path "${ssh_target}" "path" "codex-clipboard")"; then
+          remote_path="$(trim "${remote_path}")"
+          if [[ -n "${remote_path}" ]]; then
+            copy_text_to_local_clipboard "${remote_path}"
+            printf '[%s] uploaded clipboard image to %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "${remote_path}"
+          fi
+        else
+          printf '[%s] upload failed for host %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "${ssh_target}" >&2
+        fi
+        last_image_hash="${image_hash}"
+      fi
+    else
+      case "$?" in
+        2)
+          last_image_hash=""
+          ;;
+        3)
+          last_image_hash=""
+          ;;
+      esac
+    fi
+
+    rm -f "${tmp_file}"
+    sleep "${interval}"
+  done
 }
 
 remote_fetch_command() {
@@ -818,6 +1096,7 @@ Claude Code:
   Ctrl+V now uses your local clipboard over SSH.
 
 Codex:
+  Auto mode: xcv watch start
   xcv paste --copy
   Then use your terminal's normal paste shortcut.
 EOF
@@ -948,6 +1227,12 @@ doctor_command() {
     echo "Daemon process: stopped"
   fi
 
+  if watch_running; then
+    printf 'Watch process: running (pid %s)\n' "$(cat "${watch_pid_file}")"
+  else
+    echo "Watch process: stopped"
+  fi
+
   if daemon_health >/dev/null 2>&1; then
     echo "Daemon health: ok"
   else
@@ -985,6 +1270,31 @@ main() {
         run)
           shift
           daemon_run_command "$@"
+          ;;
+        *)
+          usage >&2
+          exit 1
+          ;;
+      esac
+      ;;
+    watch)
+      shift
+      case "${1:-}" in
+        start)
+          shift
+          watch_start_command "$@"
+          ;;
+        stop)
+          shift
+          watch_stop_command "$@"
+          ;;
+        status)
+          shift
+          watch_status_command "$@"
+          ;;
+        run)
+          shift
+          watch_run_command "$@"
           ;;
         *)
           usage >&2
